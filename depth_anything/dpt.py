@@ -155,7 +155,12 @@ class DPT_DINOv2(nn.Module):
         # if localhub:
         #     self.pretrained = torch.hub.load('torchhub/facebookresearch_dinov2_main', 'dinov2_{:}14'.format(encoder), source='local', pretrained=False)
         # else:
-        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_{:}14'.format(encoder), pretrained=pretrained_dino)
+        model_path = torch.hub.get_dir() + '/dinov2'  # 获取PyTorch默认下载目录
+        self.pretrained = torch.hub.load(model_path,
+                                         'dinov2_{:}14'.format(encoder),
+                                         source='local',
+                                         pretrained=False)
+        # self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_{:}14'.format(encoder), pretrained=pretrained_dino)
 
 
         dim = self.pretrained.blocks[0].attn.qkv.in_features

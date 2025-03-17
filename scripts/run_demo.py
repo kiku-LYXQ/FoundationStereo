@@ -92,8 +92,9 @@ if __name__ == "__main__":
 
     # -------------------------- 数据预处理 --------------------------
     # 读取左右视图图像
-    img0 = imageio.imread(args.left_file)  # 左视图
-    img1 = imageio.imread(args.right_file)  # 右视图
+    # todo: v3 和 v2 版本imread有区别，需要实验对比
+    img0 = imageio.v3.imread(args.left_file)  # 左视图
+    img1 = imageio.v3.imread(args.right_file)  # 右视图
 
     # 图像缩放处理
     scale = args.scale

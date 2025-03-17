@@ -134,7 +134,7 @@ class FoundationStereo(nn.Module):
         volume_dim = 28
 
         self.cnet = ContextNetDino(output_dim=[args.hidden_dims, context_dims], downsample=args.n_downsample)
-        self.update_block = BasicSelectiveMultiUpdateBlock(self.args, self.args.hidden_dims[0], volume_dim=volume_dim)
+        self.update_block = BasicSelectiveMultiUpdateBlock(self.args, self.args.hidden_dims[0], volume_dim=volume_dim) # GRU核心模块
         self.sam = SpatialAttentionExtractor()
         self.cam = ChannelAttentionEnhancement(self.args.hidden_dims[0])
 
@@ -190,68 +190,284 @@ class FoundationStereo(nn.Module):
 
         return up_disp.float()
 
-
     def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False, low_memory=False, init_disp=None):
-        """ Estimate disparity between pair of frames """
-        B = len(image1)
-        low_memory = low_memory or (self.args.get('low_memory', False))
+        """
+        立体匹配前向传播核心方法，通过迭代优化估计左右图像视差图
+
+        参数说明:
+        image1: 左视图图像张量，形状(B,C,H,W)
+        image2: 右视图图像张量，形状(B,C,H,W)
+        iters: 迭代优化次数，默认12次
+        test_mode: 测试模式标志，True时只返回最终结果，False时返回中间结果
+        low_memory: 低内存模式标志，启用特殊优化策略减少显存占用
+        init_disp: 初始视差图，可选预估值用于热启动
+
+        返回:
+        test_mode=True时: 返回最终上采样后的视差图 (B,1,H,W)
+        test_mode=False时: 返回(初始视差, 各迭代阶段视差预测列表)
+        """
+
+        # -------------------------- 初始化设置 --------------------------
+        B = len(image1)  # 批大小
+        low_memory = low_memory or self.args.get('low_memory', False)  # 内存优化模式
+
+        # 图像标准化处理 (归一化到特定范围)
         image1 = normalize_image(image1)
         image2 = normalize_image(image2)
+
+        # 混合精度计算上下文管理
         with autocast(enabled=self.args.mixed_precision):
+            # -------------------------- 特征提取 --------------------------
+            # 并行提取左右图像多尺度特征
+            # out: 多尺度特征列表，包含左右视图拼接后的特征
+            #      结构为[features_level4, features_level8, features_level16, features_level32]
+            #      每个元素的形状为 (2B, C_scale, H/scale, W/scale)
+            #      例如：
+            #      - features_level4: (2B, 224, H//4, W//4)  通道数 chans[0]*2+128 = 48 * 2+128=224
+            #      - features_level8: (2B, 192, H//8, W//8)  通道数 chans[1]*2 = 96 * 2=192
+            #      - features_level16: (2B, 320, H//16, W//16) 通道数 chans[2]*2 = 160 * 2=320
+            #      - features_level32: (2B, 304, H//32, W//32) 通道数 chans[3] = 304
+            #
+            # vit_feat: 仅左视图的ViT特征（因右视图未输入DepthAnything模型）
+            #          形状为 (B, 1024, H//4, W//4)  # ViT-L的通道数1024，分辨率与原图1/4对齐
             out, vit_feat = self.feature(torch.cat([image1, image2], dim=0))
-            vit_feat = vit_feat[:B]
-            features_left = [o[:B] for o in out]
-            features_right = [o[B:] for o in out]
-            stem_2x = self.stem_2(image1)
+            vit_feat = vit_feat[:B]  # 提取ViT特征(CNN作为骨干网络)
 
-            gwc_volume = build_gwc_volume(features_left[0], features_right[0], self.args.max_disp//4, self.cv_group)  # Group-wise correlation volume (B, N_group, max_disp, H, W)
-            left_tmp = self.proj_cmb(features_left[0])
-            right_tmp = self.proj_cmb(features_right[0])
-            concat_volume = build_concat_volume(left_tmp, right_tmp, maxdisp=self.args.max_disp//4)
-            del left_tmp, right_tmp
-            comb_volume = torch.cat([gwc_volume, concat_volume], dim=1)
-            comb_volume = self.corr_stem(comb_volume)
-            comb_volume = self.corr_feature_att(comb_volume, features_left[0])
-            comb_volume = self.cost_agg(comb_volume, features_left)
+            # 分割左右视图特征列表(每个元素为不同尺度的特征图)
+            features_left = [o[:B] for o in out]  # 左视图多级特征
+            features_right = [o[B:] for o in out]  # 右视图多级特征
 
-            # Init disp from geometry encoding volume
-            prob = F.softmax(self.classifier(comb_volume).squeeze(1), dim=1)  #(B, max_disp, H, W)
+            # 提取2x下采样特征 (用于后续上采样)
+            stem_2x = self.stem_2(image1)  # (B,C,H/2,W/2)
+
+            # -------------------------- 构建代价体积 --------------------------
+            # 组相关代价体积 (Group-wise Correlation Volume)
+            gwc_volume = build_gwc_volume(
+                features_left[0], features_right[0],
+                self.args.max_disp // 4, self.cv_group  # max_disp为最大视差搜索范围
+            )  # 形状: (B, G, D', H', W')
+            # 其中:
+            # - B: 批次大小
+            # - G: 分组数量（self.cv_group）
+            # todo: Why max_disp should be divided by 4 ?
+            # [Answer] Original max_disp is defined for input image resolution,
+            #          but feature maps are typically downsampled by a factor (e.g., 1/4).
+            #          Scale max_disp according to feature map resolution:
+            #          adjusted_max_disp = max_disp / scale_factor
+            #          where scale_factor = original_height / feature_map_height
+            #          Example: if input is 480x640 and feature map is 120x160, scale_factor=4
+            #          Add this adjustment before cost volume computation
+
+            # - D' = self.args.max_disp // 4: 当前特征图的最大视差（下采样后的视差级别数）
+            # - H' = H_ori // 4: 特征图高度（原图的1/4）
+            # - W' = W_ori // 4: 特征图宽度（原图的1/4）
+            #
+            # 示例:
+            # 若输入图像尺寸为 (H,W)=(512,512)，max_disp=256，cv_group=8，
+            # 则 gwc_volume.shape = (2, 8, 64, 128, 128)
+
+            # 连接特征代价体积
+            left_tmp = self.proj_cmb(features_left[0])  # 投影后的左特征 (B, C, H//4, W//4)
+            right_tmp = self.proj_cmb(features_right[0])  # 投影后的右特征 (B, C, H//4, W//4)
+
+            # 构建拼接式代价体积
+            # 输入特征分辨率已下采样至原图的1/4，故最大视差需同步缩放为 max_disp//4
+            concat_volume = build_concat_volume(
+                left_tmp,
+                right_tmp,
+                maxdisp=self.args.max_disp // 4  # 实际视差搜索范围 = 原始max_disp // 4
+            )  # 输出形状：(B, 2*C, max_disp//4, H//4, W//4)
+
+            del left_tmp, right_tmp  # 及时释放临时变量节省显存
+
+            # 融合两种代价体积
+            comb_volume = torch.cat([gwc_volume, concat_volume], dim=1)  # 通道维度拼接
+            comb_volume = self.corr_stem(comb_volume)  # 通过卷积压缩通道数
+            comb_volume = self.corr_feature_att(comb_volume, features_left[0])  # 加入注意力机制
+            comb_volume = self.cost_agg(comb_volume, features_left)  # 多尺度代价聚合
+
+            # -------------------------- 初始视差估计 --------------------------
+            # 通过分类器生成视差概率分布
+            prob = F.softmax(self.classifier(comb_volume).squeeze(1), dim=1)  # (B,D,H,W)
+
+            # 视差回归计算(加权求和概率分布得到连续视差值)
             if init_disp is None:
-              init_disp = disparity_regression(prob, self.args.max_disp//4)  # Weighted  sum of disparity
+                init_disp = disparity_regression(prob, self.args.max_disp // 4)  # (B,1,H/4,W/4)
 
-            cnet_list = self.cnet(image1, vit_feat=vit_feat, num_layers=self.args.n_gru_layers)   #(1/4, 1/8, 1/16)
-            cnet_list = list(cnet_list)
-            net_list = [torch.tanh(x[0]) for x in cnet_list]   # Hidden information
-            inp_list = [torch.relu(x[1]) for x in cnet_list]   # Context information list of pyramid levels
-            inp_list = [self.cam(x) * x for x in inp_list]
-            att = [self.sam(x) for x in inp_list]
+            # -------------------------- 上下文特征提取 --------------------------
+            # 通过上下文网络提取多尺度上下文信息
+            cnet_list = self.cnet(image1, vit_feat=vit_feat,
+                                  num_layers=self.args.n_gru_layers)  # 返回金字塔特征列表
 
-        geo_fn = Combined_Geo_Encoding_Volume(features_left[0].float(), features_right[0].float(), comb_volume.float(), num_levels=self.args.corr_levels, dx=self.dx)
+            # 分割隐藏状态和输入特征
+            net_list = [torch.tanh(x[0]) for x in cnet_list]  # GRU隐藏状态初始化
+            inp_list = [torch.relu(x[1]) for x in cnet_list]  # 上下文特征金字塔
+            inp_list = [self.cam(x) * x for x in inp_list]  # 通道注意力调制
+            att = [self.sam(x) for x in inp_list]  # 空间注意力图
+
+        # -------------------------- 迭代优化视差 --------------------------
+        # 初始化几何编码模块（结合特征和代价体积）
+        geo_fn = Combined_Geo_Encoding_Volume(
+            features_left[0].float(), features_right[0].float(),
+            comb_volume.float(),
+            num_levels=self.args.corr_levels,  # 多级相关层数
+            dx=self.dx  # 视差采样间隔
+        )
+
+        # 生成水平坐标网格（用于几何编码）
         b, c, h, w = features_left[0].shape
-        coords = torch.arange(w, dtype=torch.float, device=init_disp.device).reshape(1,1,w,1).repeat(b, h, 1, 1)  # (B,H,W,1) Horizontal only
-        disp = init_disp.float()
-        disp_preds = []
+        coords = torch.arange(w, device=init_disp.device).reshape(1, 1, w, 1)
+        coords = coords.repeat(b, h, 1, 1)  # (B,H,W,1) 水平坐标矩阵
 
-        # GRUs iterations to update disparity (1/4 resolution)
+        disp = init_disp.float()  # 当前视差估计
+        disp_preds = []  # 存储各迭代阶段结果
+
+        # 3层GRU模块的迭代优化循环
         for itr in range(iters):
-            disp = disp.detach()
-            geo_feat = geo_fn(disp, coords, low_memory=low_memory)
-            with autocast(enabled=self.args.mixed_precision):
-              net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, att)
+            disp = disp.detach()  # 切断梯度计算（仅用于当前迭代）
 
+            # 几何特征计算
+            geo_feat = geo_fn(disp, coords, low_memory=low_memory)
+
+            # 混合精度计算块
+            with autocast(enabled=self.args.mixed_precision):
+                # GRU单元更新隐藏状态和视差增量
+                net_list, mask_feat_4, delta_disp = self.update_block(
+                    net_list,  # 隐藏状态列表
+                    inp_list,  # 上下文特征列表
+                    geo_feat,  # 几何编码特征
+                    disp,  # 当前视差
+                    att  # 注意力图
+                )
+
+            # 视差更新（加上增量）
             disp = disp + delta_disp.float()
-            if test_mode and itr < iters-1:
+
+            # 测试模式下跳过中间结果保存
+            if test_mode and itr < iters - 1:
                 continue
 
-            # upsample predictions
-            disp_up = self.upsample_disp(disp.float(), mask_feat_4.float(), stem_2x.float())
-            disp_preds.append(disp_up)
+            # 上采样当前视差到原图分辨率
+            disp_up = self.upsample_disp(
+                disp.float(),  # 低分辨率视差
+                mask_feat_4.float(),  # 上采样掩膜特征
+                stem_2x.float()  # 2x下采样特征用于引导上采样
+            )
+            disp_preds.append(disp_up)  # 记录当前迭代结果
 
-
+        # -------------------------- 返回结果 --------------------------
         if test_mode:
-            return disp_up
+            return disp_up  # 测试模式返回最终视差图
+        return init_disp, disp_preds  # 训练模式返回初始视差和迭代过程结果
+        # 立体匹配前向传播全流程（12次迭代优化版）
 
-        return init_disp, disp_preds
+        # 1.
+        # 输入预处理阶段
+        # ├─ 1.1
+        # 图像归一化
+        # │    ├─ 左视图：image1 ∈ (B, 3, H, W) → [0, 1]
+        # 标准化
+        # │    └─ 右视图：image2 ∈ (B, 3, H, W) → 相同处理
+        # │
+        # ├─ 1.2
+        # 特征金字塔构建（并行提取）
+        # │    ├─ 拼接输入：cat([image1, image2]) ∈ (2B, 3, H, W)
+        # │    ├─ 多级特征提取：features_level
+        # {4, 8, 16, 32}
+        # │    │    ├─ level4: (2B, 224, H // 4, W // 4) → 浅层细节
+        # │    │    ├─ level8: (2B, 192, H // 8, W // 8) → 中层语义
+        # │    │    ├─ level16: (2B, 320, H // 16, W // 16) → 深层抽象
+        # │    │    └─ level32: (2B, 304, H // 32, W // 32) → 全局上下文
+        # │    │
+        # │    └─ ViT特征提取：vit_feat ∈ (B, 1024, H // 4, W // 4)
+        #
+        # 2.
+        # 代价体积构建阶段（核心匹配信息）
+        # ├─ 2.1
+        # 组相关代价体积(GWC)
+        # │    ├─ 输入：level4特征(features_left[0], features_right[0])
+        # │    ├─ 操作：分组点积计算
+        # │    ├─ 输出：gwc_volume ∈ (B, G=8, D'=max_disp//4,H//4,W//4)
+        # │    └─ 特性：保留通道间局部相关性
+        # │
+        # ├─ 2.2 拼接式代价体积(Concat)
+        # │    ├─ 特征投影：proj_cmb降维 → (B, C, H // 4, W // 4)
+        # │    ├─ 右特征平移：切片[:-i]
+        # 实现视差对齐
+        # │    ├─ 输出：concat_volume ∈ (B, 2C, D',H//4,W//4)
+        # │    └─ 特性：保留原始特征完整性
+        # │
+        # ├─ 2.3 双代价体积融合
+        # │    ├─ 通道拼接：comb_volume =[GWC; Concat] ∈ (B, 8+2C, D',H//4,W//4)
+        # │    ├─ 卷积压缩：corr_stem → 统一通道维度
+        # │    ├─ 注意力增强：corr_feature_att融合全局上下文
+        # │    └─ 多尺度聚合：cost_agg整合金字塔特征
+        #
+        # 3. 初始视差估计阶段（粗匹配）
+        # ├─ 3.1 概率分布生成
+        # │    ├─ 分类器：3D卷积 → (B, 1, D',H//4,W//4)
+        # │    └─ Softmax归一化：prob ∈ (B, D',H//4,W//4)
+        # │
+        # ├─ 3.2 视差回归
+        # │    ├─ 加权求和：∑(d * prob) → init_disp ∈ (B, 1, H // 4, W // 4)
+        # │    └─ 热启动机制：允许外部初始化(init_disp参数)
+        #
+        # 4.
+        # 上下文特征提取（动态优化基础）
+        # ├─ 4.1
+        # 多尺度上下文网络
+        # │    ├─ 输入：左视图image1 + ViT特征
+        # │    ├─ 输出：金字塔特征列表[(h1, x1), (h2, x2), ...]
+        # │    │    ├─ h: GRU隐藏状态初始化值
+        # │    │    └─ x: 上下文特征
+        # │    └─ 层级数：n_gru_layers（通常3 - 4层）
+        # │
+        # ├─ 4.2
+        # 特征增强
+        # │    ├─ 通道注意力：CAM模块动态加权特征图
+        # │    └─ 空间注意力：SAM生成空间权重掩膜
+        #
+        # 5.
+        # 迭代优化阶段（GRU循环细化）
+        # ├─ 5.1
+        # 几何编码初始化
+        # │    ├─ 构建几何函数：Combined_Geo_Encoding_Volume()
+        # │    │    ├─ 输入：左 / 右特征、融合代价体积
+        # │    │    ├─ 功能：计算当前视差下的几何一致性特征
+        # │    │    └─ 多级相关：corr_levels控制感受野
+        # │    │
+        # │    └─ 坐标网格生成：coords ∈ (B, H, W, 1)
+        # 记录水平坐标
+        # │
+        # └─ 5.2
+        # GRU迭代循环（12次）
+        # ├─ 单次迭代流程：
+        # │    ├─ 几何特征计算 → geo_feat
+        # │    │    ├─ 当前视差disp ∈ (B, 1, H // 4, W // 4)
+        # │    │    ├─ 坐标映射：disp → 右视图对应点
+        # │    │    └─ 多级相关特征采样
+        # │    │
+        # │    ├─ GRU状态更新
+        # │    │    ├─ 输入：geo_feat + 上下文特征
+        # │    │    ├─ 隐藏状态更新：net_list
+        # │    │    └─ 输出：delta_disp（视差修正量）
+        # │    │
+        # │    ├─ 视差更新：disp += delta_disp
+        # │    │
+        # │    └─ 上采样准备（最后迭代）
+        # │         ├─ 掩膜特征：mask_feat_4 ∈ (B, 9, H // 4, W // 4)
+        # │         └─ 引导特征：stem_2x ∈ (B, C, H // 2, W // 2)
+        # │
+        # └─ 5.3
+        # 结果上采样
+        # ├─ 输入：低分辨率disp + 高维特征
+        # ├─ 操作：可变形卷积引导上采样
+        # └─ 输出：disp_up ∈ (B, 1, H, W)
+        #
+        # 6.
+        # 输出阶段
+        # ├─ 测试模式：直接返回最终上采样结果disp_up
+        # └─ 训练模式：返回初始视差 + 所有迭代中间结果（用于多阶段监督）
 
 
     def run_hierachical(self, image1, image2, iters=12, test_mode=False, low_memory=False, small_ratio=0.5):

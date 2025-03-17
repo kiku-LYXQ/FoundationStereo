@@ -52,26 +52,77 @@ def toOpen3dCloud(points,colors=None,normals=None):
   return cloud
 
 
+def depth2xyzmap(depth: np.ndarray, K, uvs: np.ndarray = None, zmin=0.1):
+  """
+  将深度图转换为三维点云坐标图（每个像素对应三维坐标）
 
-def depth2xyzmap(depth:np.ndarray, K, uvs:np.ndarray=None, zmin=0.1):
-  invalid_mask = (depth<zmin)
-  H,W = depth.shape[:2]
+  参数说明：
+  depth : np.ndarray - 深度图矩阵，形状(H,W)，单位米
+  K     : np.ndarray - 相机内参矩阵，形状(3,3)，格式：
+                      [[fx, 0,  cx],
+                       [0,  fy, cy],
+                       [0,  0,  1 ]]
+  uvs   : np.ndarray - 可选，指定要计算的像素坐标集合，形状(N,2)
+  zmin  : float      - 有效深度最小值，小于该值的深度视为无效
+
+  返回：
+  xyz_map : np.ndarray - 三维坐标图，形状(H,W,3)，每个像素存储[X,Y,Z]坐标
+  """
+
+  # 生成无效点掩码（深度小于zmin的区域）
+  invalid_mask = (depth < zmin)
+
+  # 获取深度图尺寸
+  H, W = depth.shape[:2]
+
+  # 生成像素坐标网格 --------------------------------------------------------
   if uvs is None:
-    vs,us = np.meshgrid(np.arange(0,H),np.arange(0,W), sparse=False, indexing='ij')
-    vs = vs.reshape(-1)
-    us = us.reshape(-1)
+    # 当未指定uvs时，计算全图像素坐标
+    # vs: 垂直坐标矩阵（行索引），形状(H,W)
+    # us: 水平坐标矩阵（列索引），形状(H,W)
+    vs, us = np.meshgrid(
+      np.arange(0, H),  # 0到H-1的垂直坐标
+      np.arange(0, W),  # 0到W-1的水平坐标
+      sparse=False,
+      indexing='ij'  # 矩阵索引模式（i=行，j=列）
+    )
+    # 展平为1D数组（用于后续向量化计算）
+    vs = vs.reshape(-1)  # 形状(H*W,)
+    us = us.reshape(-1)  # 形状(H*W,)
   else:
-    uvs = uvs.round().astype(int)
-    us = uvs[:,0]
-    vs = uvs[:,1]
-  zs = depth[vs,us]
-  xs = (us-K[0,2])*zs/K[0,0]
-  ys = (vs-K[1,2])*zs/K[1,1]
-  pts = np.stack((xs.reshape(-1),ys.reshape(-1),zs.reshape(-1)), 1)  #(N,3)
-  xyz_map = np.zeros((H,W,3), dtype=np.float32)
-  xyz_map[vs,us] = pts
+    # 当指定uvs时，只计算特定像素坐标
+    uvs = uvs.round().astype(int)  # 坐标取整
+    us = uvs[:, 0]  # 提取水平坐标列
+    vs = uvs[:, 1]  # 提取垂直坐标列
+
+  # 根据相机模型计算三维坐标 ------------------------------------------------
+  # 公式原理（透视投影逆变换）：
+  # X = (u - cx) * Z / fx
+  # Y = (v - cy) * Z / fy
+  # Z = depth[v,u]
+
+  # 获取深度值（注意坐标顺序是vs,us）
+  zs = depth[vs, us]  # 形状(N,)
+
+  # 计算X坐标（水平方向）
+  xs = (us - K[0, 2]) * zs / K[0, 0]  # (u - cx)*Z/fx
+  # 计算Y坐标（垂直方向）
+  ys = (vs - K[1, 2]) * zs / K[1, 1]  # (v - cy)*Z/fy
+
+  # 组合三维坐标
+  pts = np.stack((xs.reshape(-1),  # X坐标
+                  ys.reshape(-1),  # Y坐标
+                  zs.reshape(-1)),  # Z坐标
+                 1)  # 形状(N,3)
+
+  # 构建三维坐标图 --------------------------------------------------------
+  xyz_map = np.zeros((H, W, 3), dtype=np.float32)  # 初始化全零矩阵
+  xyz_map[vs, us] = pts  # 将计算的三维坐标填入对应像素位置
+
+  # 处理无效点（将深度小于zmin的位置坐标置零）
   if invalid_mask.any():
-    xyz_map[invalid_mask] = 0
+    xyz_map[invalid_mask] = 0  # 无效区域坐标设为(0,0,0)
+
   return xyz_map
 
 

@@ -396,34 +396,123 @@ def groupwise_correlation(fea1, fea2, num_groups):
     assert cost.shape == (B, num_groups, H, W)
     return cost
 
+
 def build_gwc_volume(refimg_fea, targetimg_fea, maxdisp, num_groups, stride=1):
     """
-    @refimg_fea: left image feature
-    @targetimg_fea: right image feature
+    构建分组相关代价体积(Group-wise Correlation Cost Volume)
+
+    数学原理：
+    给定左特征F^L ∈ ℝ^(B×C×H×W) 和右特征F^R ∈ ℝ^(B×C×H×W)
+    代价体积V ∈ ℝ^(B×G×D×H×W)的计算过程：
+
+    对于每个视差d ∈ [0, maxdisp):
+        1. 右特征水平平移d个像素得到F^R_shifted
+        2. 将F^L和F^R_shifted的通道分为G组：
+           每组特征维度 ℝ^(B×(C/G)×H×W)
+        3. 计算逐像素分组点积：
+           V[b,g,d,h,w] = ∑_{c∈第g组} F^L[b,c,h,w] * F^R_shifted[b,c,h,w]
+
+    参数说明：
+    @refimg_fea:    左图特征张量，形状 (Batch, Channels, Height, Width)
+    @targetimg_fea: 右图特征张量，形状需与左图特征相同
+    @maxdisp:       最大视差搜索范围（通常基于下采样后的特征图分辨率设定）
+    @num_groups:    分组数量（G），将通道划分为G个独立计算组（GPU显存有限时，增大 G 可降低单组计算量；污染仅影响少数组，其余组仍能提供可靠匹配信息；每组生成独立的匹配置信度，最终融合时能覆盖更全面的匹配线索）本质上是 特征解耦 和 计算并行化 的权衡
+    @stride:        滑动步长（当前代码未使用，保留参数供扩展）
+
+    返回：
+    5D代价体积张量，形状 (Batch, Groups, DisparityLevels, Height, Width)
+
+    运行示例：
+    假设输入特征尺寸：(B=2, C=32, H=128, W=128), maxdisp=64, num_groups=8
+    则：
+    - 每组通道数 = 32/8 = 4
+    - 当d=16时：(检测到视差有16个像素点)
+      左图有效区域：[:, :, :, 16:] (128-16=112列)
+      右图有效区域：[:, :, :, :-16] (128-16=112列)
+      计算结果填充到 volume[:, :, 16, :, 16:] (仅有效区域)
+    - 最终体积形状：(2,8,64,128,128)
     """
-    B, C, H, W = refimg_fea.shape
-    volume = refimg_fea.new_zeros([B, num_groups, maxdisp, H, W])
+
+    # 获取输入特征图的基本形状参数
+    B, C, H, W = refimg_fea.shape  # B:批大小 | C:通道数 | H:特征图高度 | W:特征图宽度
+
+    # 初始化全零代价体积（显存预分配）
+    volume = refimg_fea.new_zeros([B, num_groups, maxdisp, H, W])  # 形状(B,G,D,H,W)
+
+    # 遍历所有可能的视差值（构建视差维度）
     for i in range(maxdisp):
-        if i > 0:
-            volume[:, :, i, :, i:] = groupwise_correlation(refimg_fea[:, :, :, i:], targetimg_fea[:, :, :, :-i], num_groups)
-        else:
-            volume[:, :, i, :, :] = groupwise_correlation(refimg_fea, targetimg_fea, num_groups)
+        """
+        视差计算数学表达：
+        当视差为i时，等效于将右图向左平移i个像素
+        匹配关系满足：x_R = x_L - i (需保证x_R ≥ 0)
+        因此有效区域为：左图x ∈ [i, W) 对应右图x ∈ [0, W-i)
+        """
+        if i > 0:  # 处理非零视差情况
+            # 切片操作实现平移对齐（避免无效区域计算）
+            # 左图：从第i列开始 | 右图：到倒数第i列结束
+            # 计算后的相关性结果填充到右图有效区域对应的位置（第i列之后）
+            volume[:, :, i, :, i:] = groupwise_correlation(
+                refimg_fea[:, :, :, i:],  # 左图有效区域：W-i列
+                targetimg_fea[:, :, :, :-i],  # 右图有效区域：W-i列
+                num_groups
+            )
+        else:  # 处理零视差情况（完全对齐）
+            # 全图直接计算相关性
+            volume[:, :, i, :, :] = groupwise_correlation(
+                refimg_fea,
+                targetimg_fea,
+                num_groups
+            )
+
+    # 确保内存连续布局（优化后续卷积操作效率）
     volume = volume.contiguous()
+
     return volume
 
 
-
 def build_concat_volume(refimg_fea, targetimg_fea, maxdisp):
-    B, C, H, W = refimg_fea.shape
+    """
+    构建通道拼接的代价体积（用于后续3D卷积处理）
+
+    参数说明：
+    @refimg_fea:    左图特征张量，形状 (Batch, Channels, Height, Width)
+    @targetimg_fea: 右图特征张量，形状需与左图相同
+    @maxdisp:       最大视差搜索范围
+
+    返回：
+    5D代价体积张量，形状 (Batch, 2*Channels, MaxDisp, Height, Width)
+    """
+
+    # 获取左图特征的基本形状参数
+    B, C, H, W = refimg_fea.shape  # B:批大小 | C:通道数 | H:高度 | W:宽度
+
+    # 初始化全零代价体积（显存预分配）
+    # 体积维度：通道维度是左右特征拼接后的2*C
     volume = refimg_fea.new_zeros([B, 2 * C, maxdisp, H, W])
+
+    # 遍历所有可能的视差值（构建视差维度）
     for i in range(maxdisp):
-        if i > 0:
+        """ 当视差为i时的处理逻辑：
+        1. 左特征保持完整
+        2. 右特征需左移i个像素（即切片[:, :, :, :-i]）
+        3. 将左右特征沿通道维度拼接，填充到对应视差层
+        """
+        if i > 0:  # 非零视差情况（右特征需要水平平移）
+            # 左特征填充到前C个通道（所有位置）
             volume[:, :C, i, :, :] = refimg_fea[:, :, :, :]
+
+            # 右特征填充到后C个通道（仅有效区域）
+            # 右特征切片：去除右侧i列（相当于左移i像素）
+            # 填充位置：从第i列开始（与左图第i列对齐）
             volume[:, C:, i, :, i:] = targetimg_fea[:, :, :, :-i]
-        else:
+        else:  # 零视差情况（完全对齐）
+            # 左右特征直接拼接
             volume[:, :C, i, :, :] = refimg_fea
             volume[:, C:, i, :, :] = targetimg_fea
+
+    # 确保内存连续布局（优化后续卷积效率）
     volume = volume.contiguous()
+
     return volume
 
 

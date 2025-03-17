@@ -344,12 +344,12 @@ class Feature(nn.Module):
         B,C,H,W = x.shape
         divider = np.lcm(self.patch_size, 16)
         H_resize, W_resize = get_resize_keep_aspect_ratio(H,W, divider=divider, max_H=1344, max_W=1344)
-        x_in_ = F.interpolate(x, size=(H_resize, W_resize), mode='bicubic', align_corners=False)
+        x_in_ = F.interpolate(x, size=(H_resize, W_resize), mode='bicubic', align_corners=False)   # 调整输入尺寸为 14 的倍数
         self.dino = self.dino.eval()
         with torch.no_grad():
           output = self.dino(x_in_)
         vit_feat = output['out']
-        vit_feat = F.interpolate(vit_feat, size=(H//4,W//4), mode='bilinear', align_corners=True)
+        vit_feat = F.interpolate(vit_feat, size=(H//4,W//4), mode='bilinear', align_corners=True)  # 将 ViT 特征分辨率对齐到 CNN 特征的 1/4 尺度（与 x4 特征融合）
         x = self.stem(x)
         x4 = self.stages[0](x)
         x8 = self.stages[1](x4)

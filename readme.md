@@ -47,9 +47,15 @@ conda activate foundation_stereo
 - Download the foundation model for zero-shot inference on your data from [here](https://drive.google.com/drive/folders/1VhPebc_mMxWKccrv7pdQLTvXYVcLYpsf?usp=sharing). Put the entire folder (e.g. `23-51-11`) under `./pretrained_models/`.
 
 
+| Model | Description |
+| ----- | ----------- |
+| 23-51-11 | Our best performing model for general use, based on Vit-large |
+| 11-33-40 | Slightly lower accuracy but faster inference, based on Vit-small |
+
+
 # Run demo
 ```
-python scripts/run_demo.py --left_file ./assets/left.png --right_file ./assets/right.png --ckpt_dir ./pretrained_models/model_best_bp2.pth --out_dir ./test_outputs/
+python scripts/run_demo.py --left_file ./assets/left.png --right_file ./assets/right.png --ckpt_dir ./pretrained_models/23-51-11/model_best_bp2.pth --out_dir ./test_outputs/
 ```
 You can see output point cloud.
 

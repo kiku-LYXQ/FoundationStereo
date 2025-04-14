@@ -16,16 +16,33 @@ from Utils import *
 
 class Combined_Geo_Encoding_Volume:
     def __init__(self, init_fmap1, init_fmap2, geo_volume, num_levels=2, dx=None):
+        """
+            多尺度几何编码与相关性融合模块（金字塔结构）
+
+            参数:
+                init_fmap1 (Tensor): 初始特征图1，形状 (B, C, H, W)
+                init_fmap2 (Tensor): 初始特征图2，形状 (B, C, H, W)
+                geo_volume (Tensor): 3D几何体积数据，形状 (B, C, D, H, W)
+                num_levels (int): 金字塔层级数（默认2层）
+                dx (Tensor): 初始位移参数（用于坐标对齐）
+        """
         self.num_levels = num_levels
-        self.geo_volume_pyramid = []
-        self.init_corr_pyramid = []
+        self.geo_volume_pyramid = [] # 存储多尺度几何体积
+        self.init_corr_pyramid = []  # 存储多尺度初始相关性
         self.dx = dx
 
-        # all pairs correlation
+        # ------------------- 阶段1：计算初始相关性图 -------------------
+        # 计算左右视图特征图之间的归一化相关性
+        # 输入形状: (B,C,H,W) x2 → 输出形状: (B,H,W,1,W2)
+        # 其中W2为右视图特征图的宽度（相关窗口）
         init_corr = Combined_Geo_Encoding_Volume.corr(init_fmap1, init_fmap2)
 
-        b, h, w, _, w2 = init_corr.shape
-        b, c, d, h, w = geo_volume.shape
+        # ------------------- 阶段2：数据形状预处理 -------------------
+        # 解析张量形状
+        b, h, w, _, w2 = init_corr.shape # init_corr形状: (B,H,W,1,W2)
+        b, c, d, h, w = geo_volume.shape  # geo_volume形状:(B, C, D, H, W)
+        # 几何体积形状重塑：
+        # (B,C,D,H,W) → [维度置换] → (B,H,W,C,D) → [合并空间维度] → (B*H*W,C,1,D)
         geo_volume = geo_volume.permute(0, 3, 4, 1, 2).reshape(b*h*w, c, 1, d).contiguous()
 
         init_corr = init_corr.reshape(b*h*w, 1, 1, w2)

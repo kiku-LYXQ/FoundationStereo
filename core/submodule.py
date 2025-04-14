@@ -221,7 +221,9 @@ class FlashMultiheadAttention(nn.Module):
         K = K.view(K.size(0), K.size(1), self.num_heads, self.head_dim)
         V = V.view(V.size(0), V.size(1), self.num_heads, self.head_dim)
 
-        attn_output = flash_attn_func(Q, K, V, window_size=window_size)  # Replace with actual FlashAttention function
+        # todo: onnx库中自定义算子实现没有的解决方法
+        attn_output = flash_attn_func(Q, K, V, window_size=window_size)  # Replace with actual FlashAttention function   pytorch用这个
+        # attn_output = F.scaled_dot_product_attention(Q, K, V) # onnx用这个
 
         attn_output = attn_output.reshape(B,L,-1)
         output = self.out_proj(attn_output)
@@ -386,20 +388,43 @@ class Conv2x_IN(nn.Module):
 
 
 def groupwise_correlation(fea1, fea2, num_groups):
+    # 计算时W宽度通常为1，循环迭代这个函数计算相关性
+    # 此函数对应为论文中的求点积过程
+    # 每个输出位置的值表示：在特定组内，左右特征图的对应位置特征相似度
+    # 输入特征形状: fea1 和 fea2 均为 [B, C, H, W]
     B, C, H, W = fea1.shape
+
+    # 检查通道数是否可被分组数整除
     assert C % num_groups == 0, f"C:{C}, num_groups:{num_groups}"
+
+    # 计算每个组的通道数
     channels_per_group = C // num_groups
+
+    # 将特征按通道维度分组
+    # [B, C, H, W] -> [B, num_groups, C/num_groups, H, W]
     fea1 = fea1.reshape(B, num_groups, channels_per_group, H, W)
     fea2 = fea2.reshape(B, num_groups, channels_per_group, H, W)
+
+    # 使用混合精度上下文 (禁用自动类型转换)
     with torch.cuda.amp.autocast(enabled=False):
+      # 第一部分
+      # 特征归一化: 沿通道维度(channels_per_group)进行L2归一化
+      # 输入形状: [B, num_groups, C/num_groups, H, W]
+      # 输出形状: 保持原形状，但每个通道向量被归一化为单位向量
+      # 第二部分
+      # 计算分组相关性: 逐元素相乘后沿通道维度求和
+      # 数学等价于两个单位向量的点积 -> 余弦相似度
       cost = (F.normalize(fea1.float(), dim=2) * F.normalize(fea2.float(), dim=2)).sum(dim=2)  #!NOTE Divide first for numerical stability
-    assert cost.shape == (B, num_groups, H, W)
+    assert cost.shape == (B, num_groups, H, W) # 输出形状
     return cost
 
 
 def build_gwc_volume(refimg_fea, targetimg_fea, maxdisp, num_groups, stride=1):
     """
     构建分组相关代价体积(Group-wise Correlation Cost Volume)
+
+    max_disp 是立体匹配任务中定义的 ​最大视差搜索范围，表示在左图和右图之间寻找对应点时，允许的最大水平位移（单位为像素）。
+    例如：若 max_disp=192，表示算法会在左图的每个像素点，向右侧搜索最多 192 个像素的距离，寻找右图中的匹配点。
 
     数学原理：
     给定左特征F^L ∈ ℝ^(B×C×H×W) 和右特征F^R ∈ ℝ^(B×C×H×W)
@@ -449,11 +474,13 @@ def build_gwc_volume(refimg_fea, targetimg_fea, maxdisp, num_groups, stride=1):
         """
         if i > 0:  # 处理非零视差情况
             # 切片操作实现平移对齐（避免无效区域计算）
-            # 左图：从第i列开始 | 右图：到倒数第i列结束
+            # 当视差为 i 时，右图需要向左平移 i 个像素才能与左图对应区域对齐。此时：
+            # 左图的有效区域：x_L ∈[i,W)（左图从第 i 列开始到末尾）。
+            # 右图的有效区域：x_R ∈[0,W−i)（右图从第 0 列开始到倒数第 i 列）。
             # 计算后的相关性结果填充到右图有效区域对应的位置（第i列之后）
             volume[:, :, i, :, i:] = groupwise_correlation(
-                refimg_fea[:, :, :, i:],  # 左图有效区域：W-i列
-                targetimg_fea[:, :, :, :-i],  # 右图有效区域：W-i列
+                refimg_fea[:, :, :, i:],  # 左图有效区域：i到W列
+                targetimg_fea[:, :, :, :-i],  # 右图有效区域：0到W-i列
                 num_groups
             )
         else:  # 处理零视差情况（完全对齐）
@@ -526,10 +553,24 @@ def disparity_regression(x, maxdisp):
 
 class FeatureAtt(nn.Module):
     def __init__(self, cv_chan, feat_chan):
+        """
+        特征注意力模块：通过特征图生成注意力权重，调整Cost Volume的通道特征
+
+        参数:
+            cv_chan (int): Cost Volume的通道数（最终输出的通道数）
+            feat_chan (int): 输入特征图(feat)的通道数
+        """
         super(FeatureAtt, self).__init__()
 
+        # 特征注意力权重生成器 输出的是特征
         self.feat_att = nn.Sequential(
+            # 降维卷积：将特征图通道数减半
+            # 输入形状：(B, feat_chan, H, W)
+            # 输出形状：(B, feat_chan//2, H, W)
             BasicConv(feat_chan, feat_chan//2, kernel_size=1, stride=1, padding=0),
+            # 1x1卷积：将通道数对齐到Cost Volume的通道数(cv_chan)
+            # 输入形状：(B, feat_chan//2, H, W)
+            # 输出形状：(B, cv_chan, H, W)
             nn.Conv2d(feat_chan//2, cv_chan, 1)
             )
 
@@ -537,10 +578,30 @@ class FeatureAtt(nn.Module):
         '''
         @cv: cost volume (B,C,D,H,W)
         @feat: (B,C,H,W)
+        前向传播流程
+
+        参数:
+            cv: Cost Volume张量，形状 (B, C, D, H, W)
+                其中:
+                - B: 批次大小
+                - C: 通道数（cv_chan）
+                - D: 深度/视差维度
+                - H/W: 空间高度/宽度
+            feat: 输入特征图，形状 (B, C_feat, H, W)
+                其中 C_feat = feat_chan（初始化参数）
+
+        返回:
+            调整后的Cost Volume，形状 (B, C, D, H, W)
         '''
-        feat_att = self.feat_att(feat).unsqueeze(2)   #(B,C,1,H,W)
-        cv = torch.sigmoid(feat_att)*cv
-        return cv
+        # 步骤1: 生成注意力权重（2D → 3D广播）
+        # todo:why we need unsqueeze(2)?
+        # 保证和cv维度一致方便相乘， 在相乘时，pytorch会自动扩展1到D，也就是复制D次，此时feat_att变为(B, C, D, H, W)
+        # 每个深度位置 D 共享相同的空间注意力权重
+        feat_att = self.feat_att(feat).unsqueeze(2)   # 输出形状: (B, cv_chan, H, W) -> 插入深度维度 → (B, cv_chan, 1, H, W)
+
+        # 步骤2: 应用注意力权重调整Cost Volume
+        cv = torch.sigmoid(feat_att)*cv # 权重归一化到[0, 1]
+        return cv    # 广播乘法 → (B, C, D, H, W)
 
 def context_upsample(disp_low, up_weights):
     """

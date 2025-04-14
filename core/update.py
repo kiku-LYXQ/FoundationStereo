@@ -166,6 +166,7 @@ class SelectiveConvGRU(nn.Module):
             (5) 双路GRU计算 → (B,128,H,W) * 2
             (6) 注意力加权融合 → (B,128,H,W)         改进点2： 对大小核的GRU模块进行加权融合，以融合后做为最终输出
         """
+        # 3×3卷积 + ReLU 的组合是CNN的经典设计（如VGG、ResNet），能有效提取局部特征并增强非线性表达能力。
         # 步骤1: 拼接输入特征（假设x包含多个特征图）
         # x = [feat1, feat2] → (B,256,H,W)（当input_dim=256时）   这里对应为池化后的隐藏初始net和inp做拼接
         x = torch.cat(x, dim=1)  # 沿通道维度拼接
@@ -211,8 +212,8 @@ class BasicSelectiveMultiUpdateBlock(nn.Module):
             # gru16输入维度: hidden_dim*2=256（来自pool后的下层特征）
             # 输出维度: hidden_dim=128（保持与隐藏状态一致）
             self.gru16 = SelectiveConvGRU(
-                input_dim=hidden_dim * 2,  # 输入通道数 256
-                hidden_dim=hidden_dim  # 隐藏状态维度 128
+                hidden_dim,  # 输入通道数 256
+                hidden_dim * 2  # 隐藏状态维度 128
             )
 
         # ------------------------- 第2层GRU (1/8分辨率) --------------------------
@@ -221,22 +222,22 @@ class BasicSelectiveMultiUpdateBlock(nn.Module):
             # - 当存在第3层时: hidden_dim + hidden_dim*2=384 (下层池化特征+上层插值特征)
             # - 当仅有2层时: hidden_dim*2=256
             input_dim = hidden_dim * (args.n_gru_layers == 3) + hidden_dim * 2
-            self.gru08 = SelectiveConvGRU(input_dim, hidden_dim)
+            self.gru08 = SelectiveConvGRU(hidden_dim, input_dim)
 
         # ------------------------- 第1层GRU (1/4分辨率) ---------------------------
         # gru04输入维度:
         # - 当存在上层时: hidden_dim + hidden_dim*2=384 (下层池化特征+上层插值特征)
         # - 当无上层时: hidden_dim*2=256
         self.gru04 = SelectiveConvGRU(
-            input_dim=hidden_dim * (args.n_gru_layers > 1) + hidden_dim * 2,
-            hidden_dim=hidden_dim
+            hidden_dim,
+            hidden_dim * (args.n_gru_layers > 1) + hidden_dim * 2
         )
 
         # 视差预测头: 将GRU隐藏状态映射为视差增量
         # 输入: (B,128,H/4,W/4) → 输出: (B,1,H/4,W/4)
         self.disp_head = DispHead(
-            in_dim=hidden_dim,  # 128
-            feat_dim=256  # 中间特征维度
+            hidden_dim,  # 128
+            256  # 中间特征维度
         )
 
         # 上采样掩膜生成网络

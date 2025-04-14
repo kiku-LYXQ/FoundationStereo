@@ -21,10 +21,10 @@ class FoundationStereoOnnx(FoundationStereo):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_path', type=str, default=f'{code_dir}/../output/foundation_stereo.onnx', help='Path to save results.')
-    parser.add_argument('--ckpt_dir', default=f'{code_dir}/../pretrained_models/23-51-11/model_best_bp2.pth', type=str, help='pretrained model path')
-    parser.add_argument('--height', type=int, default=480)
-    parser.add_argument('--width', type=int, default=640)
-    parser.add_argument('--valid_iters', type=int, default=22, help='number of flow-field updates during forward pass')
+    parser.add_argument('--ckpt_dir', default=f'{code_dir}/../pretrained_models/model_best_bp2.pth', type=str, help='pretrained model path')
+    parser.add_argument('--height', type=int, default=544)
+    parser.add_argument('--width', type=int, default=960)
+    parser.add_argument('--valid_iters', type=int, default=40, help='number of flow-field updates during forward pass')
 
     args = parser.parse_args()
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
@@ -39,7 +39,7 @@ def main():
     logging.info(f"args:\n{args}")
     logging.info(f"Using pretrained model from {ckpt_dir}")
     model = FoundationStereoOnnx(cfg)
-    ckpt = torch.load(ckpt_dir)
+    ckpt = torch.load(ckpt_dir, weights_only=False)
     logging.info(f"ckpt global_step:{ckpt['global_step']}, epoch:{ckpt['epoch']}")
     model.load_state_dict(ckpt['model'])
     model.cuda()

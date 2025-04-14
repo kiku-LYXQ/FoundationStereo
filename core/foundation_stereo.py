@@ -129,7 +129,7 @@ class FoundationStereo(nn.Module):
         super().__init__()
         self.args = args
 
-        context_dims = args.hidden_dims
+        context_dims = args.hidden_dims # cfg中的值是[128, 128, 128]
         self.cv_group = 8
         volume_dim = 28
 
@@ -141,6 +141,9 @@ class FoundationStereo(nn.Module):
         self.context_zqr_convs = nn.ModuleList([nn.Conv2d(context_dims[i], args.hidden_dims[i]*3, kernel_size=3, padding=3//2) for i in range(self.args.n_gru_layers)])
 
         self.feature = Feature()
+        # d_out是各阶段输出通道数（用于后续立体匹配网络）
+        # d_out = [chans[0]*2+128, chans[1]*2, chans[2]*2, chans[3]]
+        # chans = [48, 96, 160, 304]
         self.proj_cmb = nn.Conv2d(self.feature.d_out[0], 12, kernel_size=1, padding=0)
 
         self.stem_2 = nn.Sequential(
@@ -160,7 +163,8 @@ class FoundationStereo(nn.Module):
           nn.ConvTranspose2d(2*32, 9, kernel_size=4, stride=2, padding=1),
           )
 
-
+        # volume_dim = 28
+        # 论文里的APC模块
         self.corr_stem = nn.Sequential(
             nn.Conv3d(32, volume_dim, kernel_size=1),
             BasicConv(volume_dim, volume_dim, kernel_size=3, padding=1, is_3d=True),
@@ -195,8 +199,8 @@ class FoundationStereo(nn.Module):
         立体匹配前向传播核心方法，通过迭代优化估计左右图像视差图
 
         参数说明:
-        image1: 左视图图像张量，形状(B,C,H,W)
-        image2: 右视图图像张量，形状(B,C,H,W)
+        image1: 左视图图像张量，形状(B,C,H,W) demo运行时输入(1, 3, 544, 960)
+        image2: 右视图图像张量，形状(B,C,H,W) demo运行时输入(1, 3, 544, 960)
         iters: 迭代优化次数，默认12次
         test_mode: 测试模式标志，True时只返回最终结果，False时返回中间结果
         low_memory: 低内存模式标志，启用特殊优化策略减少显存占用
@@ -229,27 +233,31 @@ class FoundationStereo(nn.Module):
             #      - features_level32: (2B, 304, H//32, W//32) 通道数 chans[3] = 304
             #
             # vit_feat: 仅左视图的ViT特征（因右视图未输入DepthAnything模型）
-            #          形状为 (B, 1024, H//4, W//4)  # ViT-L的通道数1024，分辨率与原图1/4对齐
-            out, vit_feat = self.feature(torch.cat([image1, image2], dim=0))
-            vit_feat = vit_feat[:B]  # 提取ViT特征(CNN作为骨干网络)
+            #          形状为 (B, 128, H//4, W//4)  # 分辨率与原图1/4对齐
+            out, vit_feat = self.feature(torch.cat([image1, image2], dim=0)) # out 是论文里的CNN模块(EdgeNeXt-S模块)输出，vit_feature是DeepAnything模块输出
+            vit_feat = vit_feat[:B]  # 提取ViT特征(CNN作为骨干网络) 确保即使 ViT 的输出批量维度异常（如 N ≠ B），代码仍能安全运行
 
             # 分割左右视图特征列表(每个元素为不同尺度的特征图)
-            features_left = [o[:B] for o in out]  # 左视图多级特征
+            # 论文中的f_l和f_r
+            features_left = [o[:B] for o in out]  # 左视图多级特征    因为feature是左右图拼接处理的，后面的输出前B个为左深度特征图，后B个为右深度特征图
             features_right = [o[B:] for o in out]  # 右视图多级特征
 
             # 提取2x下采样特征 (用于后续上采样)
-            stem_2x = self.stem_2(image1)  # (B,C,H/2,W/2)
+            stem_2x = self.stem_2(image1)  # 输出：(B, 32, H//2, W//2)
 
-            # -------------------------- 构建代价体积 --------------------------
+            # -------------------------- 构建混合代价体（V_C） --------------------------
             # 组相关代价体积 (Group-wise Correlation Volume)
+            # features_left和features_right中有四种不同采样分辨率的特征图，使用第一种特征图作为构建体积代价的方法,第一种才是论文中的fl和fr
+            # 输入是 features_level4 (B, 224, H//4, W//4)
+            # 输出是视差相关度代价体
             gwc_volume = build_gwc_volume(
                 features_left[0], features_right[0],
                 self.args.max_disp // 4, self.cv_group  # max_disp为最大视差搜索范围
-            )  # 形状: (B, G, D', H', W')
+            )  # 输出形状: (B, G = 8, self.args.max_disp // 4, H//4, W//4)
             # 其中:
             # - B: 批次大小
-            # - G: 分组数量（self.cv_group）
-            # todo: Why max_disp should be divided by 4 ?
+            # - G: 分组数量（self.cv_group） 8
+            # todo: Why max_disp should be divided by 4 ?   因为特征图是原始图片的1/4，而max_disp对应的是原始image输入的
             # [Answer] Original max_disp is defined for input image resolution,
             #          but feature maps are typically downsampled by a factor (e.g., 1/4).
             #          Scale max_disp according to feature map resolution:
@@ -259,16 +267,12 @@ class FoundationStereo(nn.Module):
             #          Add this adjustment before cost volume computation
 
             # - D' = self.args.max_disp // 4: 当前特征图的最大视差（下采样后的视差级别数）
-            # - H' = H_ori // 4: 特征图高度（原图的1/4）
-            # - W' = W_ori // 4: 特征图宽度（原图的1/4）
-            #
-            # 示例:
-            # 若输入图像尺寸为 (H,W)=(512,512)，max_disp=256，cv_group=8，
-            # 则 gwc_volume.shape = (2, 8, 64, 128, 128)
+            # - H' = H_ori // 4: 特征图高度（输入image的1/4）
+            # - W' = W_ori // 4: 特征图宽度（输入image的1/4）
 
-            # 连接特征代价体积
-            left_tmp = self.proj_cmb(features_left[0])  # 投影后的左特征 (B, C, H//4, W//4)
-            right_tmp = self.proj_cmb(features_right[0])  # 投影后的右特征 (B, C, H//4, W//4)
+            # 连接特征代价体积（一个二维卷积层）
+            left_tmp = self.proj_cmb(features_left[0])  # 输入：投影后的左特征 (B, 224, H//4, W//4) 输出：(B, 12, H//4, W//4)
+            right_tmp = self.proj_cmb(features_right[0])  # 输入：投影后的右特征 (B, 224, H//4, W//4) 输出：(B, 12, H//4, W//4)
 
             # 构建拼接式代价体积
             # 输入特征分辨率已下采样至原图的1/4，故最大视差需同步缩放为 max_disp//4
@@ -276,23 +280,27 @@ class FoundationStereo(nn.Module):
                 left_tmp,
                 right_tmp,
                 maxdisp=self.args.max_disp // 4  # 实际视差搜索范围 = 原始max_disp // 4
-            )  # 输出形状：(B, 2*C, max_disp//4, H//4, W//4)
+            )  # 输出形状：(B, 24, max_disp//4, H//4, W//4)
 
             del left_tmp, right_tmp  # 及时释放临时变量节省显存
 
+            # AHCF模块，具体原理还得看看 同时AHCF只用了左特征图，论文图片看不出来
             # 融合两种代价体积
-            comb_volume = torch.cat([gwc_volume, concat_volume], dim=1)  # 通道维度拼接
-            comb_volume = self.corr_stem(comb_volume)  # 通过卷积压缩通道数
-            comb_volume = self.corr_feature_att(comb_volume, features_left[0])  # 加入注意力机制
-            comb_volume = self.cost_agg(comb_volume, features_left)  # 多尺度代价聚合
+            comb_volume = torch.cat([gwc_volume, concat_volume], dim=1)  # 沿着C通道进行维度拼接，dim=1是C通道 这里得到的才是论文中的VC体积块
+            # todo:论文这里讲的不是特别清楚，为什么又突然用到了左图的深度特征图？
+            # 论文里的APC模块（一种沙漏网络，输入输出形状关于中间层对称的网络）
+            comb_volume = self.corr_stem(comb_volume)  # 通过卷积压缩通道数 输出形状：(B, 28, max_disp//4, H//4, W//4) 论文里的APC模块
+            # 下面这两行代码只用到了features_left的属性中的某些输出维度大小
+            comb_volume = self.corr_feature_att(comb_volume, features_left[0])  # 加入注意力机制，这个attention不是论文中的DT 输出形状：(B, 28, max_disp//4, H//4, W//4)
+            comb_volume = self.cost_agg(comb_volume, features_left)  # 这里面包含论文中的DT模块，多尺度代价聚合 输出形状：(B, 28, max_disp//4, H//4, W//4)
 
             # -------------------------- 初始视差估计 --------------------------
             # 通过分类器生成视差概率分布
-            prob = F.softmax(self.classifier(comb_volume).squeeze(1), dim=1)  # (B,D,H,W)
+            prob = F.softmax(self.classifier(comb_volume).squeeze(1), dim=1)  # 输出：(B, max_disp//4, H, W)   这里对应论文的V'_C
 
             # 视差回归计算(加权求和概率分布得到连续视差值)
             if init_disp is None:
-                init_disp = disparity_regression(prob, self.args.max_disp // 4)  # (B,1,H/4,W/4)
+                init_disp = disparity_regression(prob, self.args.max_disp // 4)  # (B,1,H/4,W/4)   对应论文的 init_disp
 
             # -------------------------- 上下文特征提取 --------------------------
             # 通过上下文网络提取多尺度上下文信息
@@ -306,7 +314,8 @@ class FoundationStereo(nn.Module):
             att = [self.sam(x) for x in inp_list]  # 空间注意力图
 
         # -------------------------- 迭代优化视差 --------------------------
-        # 初始化几何编码模块（结合特征和代价体积）
+        # 初始化几何编码模块（结合特征和代价体积） 左右特征图结合构造成对相关性体积模块的初始化
+        # 对应为论文中的GRU迭代初始化部分，包括了fl,Fr点积生成V_corr过程
         geo_fn = Combined_Geo_Encoding_Volume(
             features_left[0].float(), features_right[0].float(),
             comb_volume.float(),
@@ -322,7 +331,7 @@ class FoundationStereo(nn.Module):
         disp = init_disp.float()  # 当前视差估计
         disp_preds = []  # 存储各迭代阶段结果
 
-        # 3层GRU模块的迭代优化循环
+        # 3层GRU模块的迭代优化循环（开始迭代）
         for itr in range(iters):
             disp = disp.detach()  # 切断梯度计算（仅用于当前迭代）
 

@@ -5,6 +5,7 @@
 # 导入系统模块
 import os
 import sys
+import time
 import argparse
 import logging
 import imageio  # 用于图像读写
@@ -113,6 +114,7 @@ if __name__ == "__main__":
     padder = InputPadder(img0.shape, divis_by=32, force_square=False)
     img0, img1 = padder.pad(img0, img1)
 
+    infer_start = time.time()
     # -------------------------- 模型推理 --------------------------
     with torch.cuda.amp.autocast(True):  # 启用混合精度推理
         if not args.hiera:
@@ -121,6 +123,9 @@ if __name__ == "__main__":
         else:
             # 分层推理模式（处理超高分辨率）
             disp = model.run_hierachical(img0, img1, iters=args.valid_iters, test_mode=True, small_ratio=0.5)
+
+    infer_end = time.time()
+    print(f"耗时: {infer_end - infer_start:.2f} 秒")
 
     # 后处理：移除填充并转换到CPU
     disp = padder.unpad(disp.float())

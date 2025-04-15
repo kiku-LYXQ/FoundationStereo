@@ -1,7 +1,7 @@
 import warnings, argparse, logging, os, sys
 code_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(f'{code_dir}/../')
-import omegaconf, yaml, torch
+import omegaconf, yaml, torch,pdb
 from omegaconf import OmegaConf
 from core.foundation_stereo import FoundationStereo
 
@@ -10,6 +10,7 @@ class FoundationStereoOnnx(FoundationStereo):
     def __init__(self, args):
         super().__init__(args)
 
+    @torch.no_grad()
     def forward(self, left, right):
         """ Removes extra outputs and hyper-parameters """
         with torch.amp.autocast('cuda', enabled=True):
@@ -18,7 +19,7 @@ class FoundationStereoOnnx(FoundationStereo):
 
 
 
-def main():
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_path', type=str, default=f'{code_dir}/../output/foundation_stereo.onnx', help='Path to save results.')
     parser.add_argument('--ckpt_dir', default=f'{code_dir}/../pretrained_models/model_best_bp2.pth', type=str, help='pretrained model path')
@@ -62,7 +63,5 @@ def main():
             'disp': {0 : 'batch_size'}
         },
     )
+    pdb.set_trace()
 
-
-if __name__ == '__main__':
-    main()

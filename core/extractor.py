@@ -190,12 +190,15 @@ class MultiBasicEncoder(nn.Module):
 
 
 class ContextNetDino(MultiBasicEncoder):
-    def __init__(self, output_dim=[128], norm_fn='batch', downsample=3):
+    def __init__(self, args, output_dim=[128], norm_fn='batch', downsample=3):
         nn.Module.__init__(self)
+
         # ------------------- ViT相关参数 -------------------
+        self.args = args
         self.patch_size = 14    # ViT的patch划分尺寸
         self.image_size = 518   # ViT的输入图像尺寸
         self.vit_feat_dim = 384 # ViT输出特征维度
+
         code_dir = os.path.dirname(os.path.realpath(__file__))
 
         # ------------------- 主干网络结构 -------------------
@@ -231,7 +234,8 @@ class ContextNetDino(MultiBasicEncoder):
           nn.Conv2d(128, 128, kernel_size=4, stride=4, padding=0),
           nn.BatchNorm2d(128),
         )
-        self.conv2 = BasicConv(128+128, 128, kernel_size=3, padding=1)
+        vit_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
+        self.conv2 = BasicConv(128+vit_dim, 128, kernel_size=3, padding=1)
         self.norm = nn.BatchNorm2d(256)
 
         output_list = []
@@ -293,16 +297,17 @@ class ContextNetDino(MultiBasicEncoder):
 
 
 class DepthAnythingFeature(nn.Module):
+    model_configs = {
+        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}
+    }
+
     def __init__(self, encoder='vits'):
         super().__init__()
-        model_configs = {
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]}
-        }
         from depth_anything.dpt import DepthAnything
         self.encoder = encoder
-        depth_anything = DepthAnything(model_configs[encoder])
+        depth_anything = DepthAnything(self.model_configs[encoder])
         self.depth_anything = depth_anything
 
         self.intermediate_layer_idx = {   #!NOTE For V2
@@ -338,16 +343,17 @@ class DepthAnythingFeature(nn.Module):
 
 
 class Feature(nn.Module):
-    def __init__(self):
+    def __init__(self, args):
         """
         STA（Stereo-Temporal Adaptation）模块的核心特征提取网络
         融合CNN的局部特征与ViT的全局语义特征，实现跨模态特征对齐
         """
         super(Feature, self).__init__()
-
+        self.args = args
         # ------------------- 主干网络初始化 -------------------
         # 使用预训练的EdgeNeXt-small作为基础CNN特征提取器
         # 论文中强调使用轻量级CNN保证计算效率，同时结合ViT的语义先验
+
         model = timm.create_model('edgenext_small', pretrained=True, features_only=False)
         self.stem = model.stem # 初始下采样层（4x）
 
@@ -358,6 +364,9 @@ class Feature(nn.Module):
         self.stages = model.stages # 多阶段特征提取器（4个阶段）
         chans = [48, 96, 160, 304]
         self.chans = chans
+        self.dino = DepthAnythingFeature(encoder=self.args.vit_size)
+        self.dino = freeze_model(self.dino)
+        vit_feat_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
 
         # ------------------- 特征解码器（Deconvolution） -------------------
         # 构建由粗到精的特征解码路径，逐步恢复空间分辨率
@@ -368,10 +377,11 @@ class Feature(nn.Module):
         self.deconv8_4 = Conv2x_IN(chans[1]*2, chans[0], deconv=True, concat=True)   # 输入: 96+48=144 → 输出48       (B, 48, H//4, W//4)
         # ViT特征融合（对应论文图示右侧的STA效果区）
         self.conv4 = nn.Sequential(
+
           # 通道数：CNN特征(chans[0]*2) + ViT特征(128) = chans[0]*2+128
-          BasicConv(chans[0]*2+128, chans[0]*2+128, kernel_size=3, stride=1, padding=1, norm='instance'),
-          ResidualBlock(chans[0]*2+128, chans[0]*2+128, norm_fn='instance'),  # 残差连接保持梯度流
-          ResidualBlock(chans[0]*2+128, chans[0]*2+128, norm_fn='instance'),  # 论文强调重复残差块提升特征鲁棒性
+          BasicConv(chans[0]*2+vit_feat_dim, chans[0]*2+vit_feat_dim, kernel_size=3, stride=1, padding=1, norm='instance'),
+          ResidualBlock(chans[0]*2+vit_feat_dim, chans[0]*2+vit_feat_dim, norm_fn='instance'),  # 残差连接保持梯度流
+          ResidualBlock(chans[0]*2+vit_feat_dim, chans[0]*2+vit_feat_dim, norm_fn='instance'),  # 论文强调重复残差块提升特征鲁棒性
         )
 
         # ------------------- 单目先验特征提取（DepthAnything ViT-L） -------------------
@@ -383,7 +393,8 @@ class Feature(nn.Module):
         # todo: patch_size的功能
         self.patch_size = 14  # ViT的patch划分尺寸，影响特征图分辨率
         # 各阶段输出通道数（用于后续立体匹配网络）
-        self.d_out = [chans[0]*2+128, chans[1]*2, chans[2]*2, chans[3]]
+        self.d_out = [chans[0]*2+vit_feat_dim, chans[1]*2, chans[2]*2, chans[3]]
+
 
     def forward(self, x):
         """

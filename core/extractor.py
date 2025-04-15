@@ -364,8 +364,13 @@ class Feature(nn.Module):
         self.stages = model.stages # 多阶段特征提取器（4个阶段）
         chans = [48, 96, 160, 304]
         self.chans = chans
-        self.dino = DepthAnythingFeature(encoder=self.args.vit_size)
-        self.dino = freeze_model(self.dino)
+        # ------------------- 单目先验特征提取（DepthAnything ViT-L） -------------------
+        # 冻结预训练的深度估计模型，提取全局语义特征（对应论文中的STA核心设计）
+        # ------------------- 特征增强模块 -------------------
+        # 在1/4分辨率层级融合ViT特征并进行特征精炼
+        self.dino = DepthAnythingFeature(encoder=self.args.vit_size) # 使用DepthAnything V2的ViT-Large版本
+        self.dino = freeze_model(self.dino) # 冻结参数，保持单目先验的稳定性
+
         vit_feat_dim = DepthAnythingFeature.model_configs[self.args.vit_size]['features']//2
 
         # ------------------- 特征解码器（Deconvolution） -------------------
@@ -384,12 +389,13 @@ class Feature(nn.Module):
           ResidualBlock(chans[0]*2+vit_feat_dim, chans[0]*2+vit_feat_dim, norm_fn='instance'),  # 论文强调重复残差块提升特征鲁棒性
         )
 
-        # ------------------- 单目先验特征提取（DepthAnything ViT-L） -------------------
+        # ------------------- 单目先验特征提取（DepthAnything ViT-L） -------------------  (old codes)
         # 冻结预训练的深度估计模型，提取全局语义特征（对应论文中的STA核心设计）
         # ------------------- 特征增强模块 -------------------
         # 在1/4分辨率层级融合ViT特征并进行特征精炼
-        self.dino = DepthAnythingFeature(encoder='vitl')  # 使用DepthAnything V2的ViT-Large版本
-        self.dino = freeze_model(self.dino)  # 冻结参数，保持单目先验的稳定性
+        # self.dino = DepthAnythingFeature(encoder='vitl')  # 使用DepthAnything V2的ViT-Large版本
+        # self.dino = freeze_model(self.dino)  # 冻结参数，保持单目先验的稳定性
+
         # todo: patch_size的功能
         self.patch_size = 14  # ViT的patch划分尺寸，影响特征图分辨率
         # 各阶段输出通道数（用于后续立体匹配网络）

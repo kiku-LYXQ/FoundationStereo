@@ -72,18 +72,25 @@ if __name__ == "__main__":
 
     # -------------------------- 模型加载 --------------------------
     # 将参数转换为OmegaConf配置对象
-    cfg = OmegaConf.create(vars(args))
+    # cfg = OmegaConf.create(vars(args))
+    ckpt_dir = args.ckpt_dir
+    # 加载模型配置文件
+    cfg = OmegaConf.load(f'{os.path.dirname(ckpt_dir)}/cfg.yaml')
+    if 'vit_size' not in cfg:
+        cfg['vit_size'] = 'vitl'
+    for k in args.__dict__:
+        cfg[k] = args.__dict__[k]
+    args = OmegaConf.create(cfg)
     logging.info(f"运行参数:\n{args}")
     logging.info(f"正在加载预训练模型: {args.ckpt_dir}")
 
-    # 加载模型配置文件
-    cfg_file = OmegaConf.load(f'{os.path.dirname(args.ckpt_dir)}/cfg.yaml')
+
 
     # 初始化立体匹配模型
-    model = FoundationStereo(cfg_file)
+    model = FoundationStereo(args)
 
     # 加载预训练权重
-    ckpt = torch.load(args.ckpt_dir, weights_only=False)  # PyTorch 2.6 开始，torch.load 默认启用 weights_only=True
+    ckpt = torch.load(ckpt_dir, weights_only=False)  # PyTorch 2.6 开始，torch.load 默认启用 weights_only=True
     logging.info(f"检查点信息 - 全局步数: {ckpt['global_step']}, 训练轮次: {ckpt['epoch']}")
     model.load_state_dict(ckpt['model'])  # 加载模型参数
 
